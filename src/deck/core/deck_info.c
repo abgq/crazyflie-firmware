@@ -162,6 +162,9 @@ static void enumerateDecks(void)
         break;
       }
 
+      if(strcmp(deckInfo->productName, "bcLoco") == 0)
+        continue;
+
       // Copy deck info to our array and set backend reference
       deckInfos[nDecks] = *deckInfo;
       deckInfos[nDecks].discoveryBackend = backend;

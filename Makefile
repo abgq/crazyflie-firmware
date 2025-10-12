@@ -45,6 +45,7 @@ image_LDFLAGS += -T $(LINKER_DIR)/FLASH_CLOAD.ld
 
 INCLUDES += -I$(srctree)/vendor/CMSIS/CMSIS/Core/Include -I$(srctree)/vendor/CMSIS/CMSIS/DSP/Include
 INCLUDES += -I$(srctree)/vendor/libdw1000/inc
+INCLUDES += -I$(srctree)/vendor/dw1k
 INCLUDES += -I$(FREERTOS)/include -I$(PORT)
 INCLUDES += -I$(srctree)/src/config
 INCLUDES += -I$(srctree)/src/platform/interface
