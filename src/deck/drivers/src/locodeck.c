@@ -429,21 +429,21 @@ static void spiRead(dwDevice_t* dev, const void *header, size_t headerLength,
   STATS_CNT_RATE_EVENT(&spiReadCount);
 }
 
-#if CONFIG_DECK_LOCODECK_USE_ALT_PINS
-  void __attribute__((used)) EXTI5_Callback(void)
-#else
-  void __attribute__((used)) EXTI11_Callback(void)
-#endif
-  {
-    portBASE_TYPE  xHigherPriorityTaskWoken = pdFALSE;
+// #if CONFIG_DECK_LOCODECK_USE_ALT_PINS
+//   void __attribute__((used)) EXTI5_Callback(void)
+// #else
+//   void __attribute__((used)) EXTI11_Callback(void)
+// #endif
+//   {
+//     portBASE_TYPE  xHigherPriorityTaskWoken = pdFALSE;
 
-    // Unlock interrupt handling task
-    vTaskNotifyGiveFromISR(uwbTaskHandle, &xHigherPriorityTaskWoken);
+//     // Unlock interrupt handling task
+//     vTaskNotifyGiveFromISR(uwbTaskHandle, &xHigherPriorityTaskWoken);
 
-    if(xHigherPriorityTaskWoken) {
-      portYIELD();
-    }
-  }
+//     if(xHigherPriorityTaskWoken) {
+//       portYIELD();
+//     }
+//   }
 
 static void spiSetSpeed(dwDevice_t* dev, dwSpiSpeed_t speed)
 {

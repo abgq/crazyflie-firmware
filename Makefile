@@ -12,7 +12,8 @@ PYTHON            ?= python3
 
 # Cload is handled in a special way on windows in WSL to use the Windows python interpreter
 ifdef WSL_DISTRO_NAME
-CLOAD_SCRIPT      ?= python.exe -m cfloader
+# CLOAD_SCRIPT      ?= python.exe -m cfloader
+CLOAD_SCRIPT      ?= /mnt/c/Users/alibe/Desktop/bitcraze/crazyflie-lib-python/.venv/Scripts/python.exe -m cfloader
 else
 CLOAD_SCRIPT      ?= $(PYTHON) -m cfloader
 endif
