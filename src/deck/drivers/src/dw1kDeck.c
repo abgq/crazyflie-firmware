@@ -47,39 +47,41 @@
 #define EXTI_LineN      EXTI_Line11
 #endif
 
-#define DEFAULT_RX_TIMEOUT 10000
-
 #define UUS_TO_DWT_TIME 64000
 
+#define DW1K_COUNTER_MASK_40_BITS UINT64_C(0xFFFFFFFFFF)
+
 // @note - example for computing the PDTCP: PRF = 64, PACS = 8, PDTCV = X, PDTCP = (127 * 4) * (1/499200000) * 8 * (X + 1) * 10e6 ≈ Y microseconds.
-#define RESP_RX_PREAMBLE_DETECTION_TIMEOUT_UUS 70
+#define RESP_RX_PREAMBLE_DETECTION_TIMEOUT_UUS 200
 
 static bool isInit = false;
 
-static uint16_t rangingIntervalMs = 1000;
-static float lastRangeMeters = 0.0f;
+static uint16_t rangingIntervalMs = 50;
 
-static uint32_t successfulMeasurements = 0;
-static uint32_t failedMeasurements = 0;
+static uint32_t lastRangingCounter = 0;
 
-// static uint8_t resetCountersRequest = 0;
+static dwt_config_t uwb_config = {3, DWT_PRF_64M, DWT_PLEN_64, DWT_PAC8, 9, 9, 0, DWT_BR_6M8, DWT_PHRMODE_STD, (64 + 1 + 8 - 8)};
 
-// static void resetCountersCallback(void)
-// {
-//   if (!isInit) {
-//     return;
-//   }
+static uint8_t uwb_poll_frame[] = {0x41, 0x88, UINT8_C(0x00), 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, UINT8_C(0x00), UINT8_C(0x00)};
+static uint8_t uwb_resp_frame[] = {0x41, 0x88, UINT8_C(0x00), 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00)};
 
-//   if (resetCountersRequest) {
-//     successfulMeasurements = 0;
-//     failedMeasurements = 0;
-//     resetCountersRequest = 0;
-//   }
-// }
+static uint8_t uwb_frame_seqnum = UINT8_C(0x00);
 
-static uint8_t spiTxBuffer[196];
-static uint8_t spiRxBuffer[196];
+static uint32_t uwb_poll_tx_resp_rx_delta = UINT32_C(0x00);
+static uint32_t uwb_poll_rx_resp_tx_delta = UINT32_C(0x00);
+
+static uint64_t uwb_poll_tx_ts = UINT64_C(0x00);
+static uint64_t uwb_resp_rx_ts = UINT64_C(0x00);
+
+static volatile uint32_t uwb_sys_status = UINT32_C(0x00);
+
+static uint8_t spiTxBuffer[128] = {UINT8_C(0x00)};
+static uint8_t spiRxBuffer[128] = {UINT8_C(0x00)};
+static uint8_t uwb_rx_buffer[128] = {UINT8_C(0x00)};
+
 static uint16_t spiSpeed = SPI_BAUDRATE_2MHZ;
+
+static TaskHandle_t dw1kTaskHandle = 0;
 
 int writetospi(uint16_t head_octets_number, const uint8_t* head_octets_buffer, uint32_t body_octets_number, const uint8_t* body_octets_buffer)
 {
@@ -113,50 +115,106 @@ void deca_sleep(unsigned int time_ms)
     vTaskDelay(M2T(time_ms));
 }
 
-static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0, 0};
-// static uint8 rx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, 0, 0, 0, 0, 0, 0};
+void dw1kHandleInterrupt(void* parameters)
+{
+    uwb_sys_status = dwt_read32bitreg(SYS_STATUS_ID);
 
-volatile uint32_t uwb_sys_status = 0x00U;
+    // DEBUG_PRINT("0x%08X\n", (unsigned int)uwb_sys_status);
+
+    if (uwb_sys_status & SYS_STATUS_TXFRS)
+    {
+        // DEBUG_PRINT("A\n");
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX);
+    }
+
+    if (uwb_sys_status & (SYS_STATUS_RXPHE | SYS_STATUS_RXRFSL))
+    {
+        // DEBUG_PRINT("B\n");
+        dwt_rxreset();
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+    }
+    else if (uwb_sys_status & (SYS_STATUS_RXPTO | SYS_STATUS_RXSFDTO))
+    {
+        // DEBUG_PRINT("C\n");
+        dwt_write32bitreg(SYS_STATUS_ID, (SYS_STATUS_RXPTO | SYS_STATUS_RXSFDTO));
+    }
+    else if (uwb_sys_status & (SYS_STATUS_LDEDONE | SYS_STATUS_RXFCG))
+    {
+        // DEBUG_PRINT("RXGOOD\n");
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD);
+
+        dwt_readfromdevice(RX_BUFFER_ID, UINT8_C(0x00), sizeof(uwb_resp_frame) - UINT8_C(0x02), uwb_rx_buffer);
+
+        if (uwb_rx_buffer[UINT8_C(0x02)] == uwb_frame_seqnum)
+        {
+            dwt_readfromdevice(TX_TIME_ID, TX_TIME_TX_STAMP_OFFSET, TX_TIME_TX_STAMP_LEN, (uint8_t*)(&uwb_poll_tx_ts));
+
+            dwt_readfromdevice(RX_TIME_ID, RX_TIME_RX_STAMP_OFFSET, RX_TIME_RX_STAMP_LEN, (uint8_t*)(&uwb_resp_rx_ts));
+
+            uwb_poll_tx_resp_rx_delta = (uint32_t)((uwb_resp_rx_ts - uwb_poll_tx_ts) & DW1K_COUNTER_MASK_40_BITS);
+
+            uwb_poll_rx_resp_tx_delta = *((uint32_t*)(&uwb_rx_buffer[sizeof(uwb_resp_frame) - UINT8_C(0x06)]));
+
+            lastRangingCounter = (uwb_poll_tx_resp_rx_delta - uwb_poll_rx_resp_tx_delta);
+
+            // DEBUG_PRINT("D\n");
+        }
+        else
+        {
+            // DEBUG_PRINT("E%u,%u\n", uwb_frame_seqnum, uwb_rx_buffer[UINT8_C(0x02)]);
+        }
+    }
+}
 
 static void dw1kDeckTask(void* parameters)
 {
     systemWaitStart();
+    vTaskDelay(M2T(10000));
     while (1)
     {
-        // Write the poll message to the TX buffer and configure the TX frame length.
-        dwt_writetodevice(TX_BUFFER_ID, 0x00U, sizeof(tx_poll_msg) - 0x02U, tx_poll_msg);
-        dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 0x01U);
+        // DEBUG_PRINT("LB\n");
 
-        // Start the TX.
-        dwt_write8bitoffsetreg(SYS_CTRL_ID, SYS_CTRL_OFFSET, (uint8_t)(SYS_CTRL_TXSTRT));
+        uwb_poll_frame[UINT8_C(2)] = uwb_frame_seqnum;
 
-        while (0x01)
+        dwt_writetodevice(TX_BUFFER_ID, UINT8_C(0x00), sizeof(uwb_poll_frame) - UINT8_C(0x02), uwb_poll_frame);
+
+        dwt_writetxfctrl(sizeof(uwb_poll_frame), UINT8_C(0x00), UINT8_C(0x01));
+
+        dwt_write8bitoffsetreg(SYS_CTRL_ID, SYS_CTRL_OFFSET, (uint8_t)(SYS_CTRL_TXSTRT | SYS_CTRL_WAIT4RESP));
+
+        if (ulTaskNotifyTake(pdTRUE, M2T(5)) > 0)
         {
-            uwb_sys_status = dwt_read32bitreg(SYS_STATUS_ID);
-            if (uwb_sys_status & SYS_STATUS_TXFRS)
-            {
-                dwt_write32bitreg(SYS_STATUS_ID, uwb_sys_status);
-                break;
-            }
-            vTaskDelay(M2T(1));
+            dw1kHandleInterrupt(NULL);
+        }
+        else
+        {
+            // DEBUG_PRINT("O\n");
         }
 
-        vTaskDelay(M2T(1000));
+        uwb_frame_seqnum++;
+
+        // DEBUG_PRINT("LE\n");
+
+        vTaskDelay(M2T(rangingIntervalMs));
     }
 }
 
-static dwt_config_t uwb_config = {
-    3,               /* Channel number. */
-    DWT_PRF_64M,     /* Pulse repetition frequency. */
-    DWT_PLEN_64,     /* Preamble length. Used in TX only. */
-    DWT_PAC8,        /* Preamble acquisition chunk size. Used in RX only. */
-    9,               /* TX preamble code. Used in TX only. */
-    9,               /* RX preamble code. Used in RX only. */
-    0,               /* 0 to use standard SFD, 1 to use non-standard SFD. */
-    DWT_BR_6M8,      /* Data rate. */
-    DWT_PHRMODE_STD, /* PHY header mode. */
-    (64 + 1 + 8 - 8) /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
-};
+#if CONFIG_DECK_LOCODECK_USE_ALT_PINS
+void __attribute__((used)) EXTI5_Callback(void)
+#else
+void __attribute__((used)) EXTI11_Callback(void)
+#endif
+{
+    portBASE_TYPE xHigherPriorityTaskWoken = pdFALSE;
+
+    // Unlock interrupt handling task
+    vTaskNotifyGiveFromISR(dw1kTaskHandle, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken)
+    {
+        portYIELD();
+    }
+}
 
 void reset_DW1000(void)
 {
@@ -166,14 +224,6 @@ void reset_DW1000(void)
     digitalWrite(GPIO_PIN_RESET, 1);
     vTaskDelay(M2T(10));
 }
-
-// void port_set_dw1000_slowrate(void)
-// {
-// }
-
-// port_set_dw1000_fastrate()
-// {
-// }
 
 static void dw1kDeckInit(DeckInfo* info)
 {
@@ -201,22 +251,23 @@ static void dw1kDeckInit(DeckInfo* info)
     pinMode(GPIO_PIN_IRQ, INPUT);
 
     reset_DW1000();
-    // port_set_dw1000_slowrate();
+
     if (dwt_initialise(DWT_LOADUCODE) == DWT_ERROR)
     {
         while (0x01U)
         {
         };
     }
-    // port_set_dw1000_fastrate();
+
     dwt_configure(&uwb_config);
     dwt_setleds(DWT_LEDS_ENABLE);
-    // dwt_setinterrupt(DWT_INT_SFDT | DWT_INT_RPHE | DWT_INT_RFSL | DWT_INT_TFRS | DWT_INT_RXDFR | DWT_INT_RXPTO);
-    // dwt_setpreambledetecttimeout(RESP_RX_PREAMBLE_DETECTION_TIMEOUT_UUS);
+    dwt_setinterrupt(DWT_INT_SFDT | DWT_INT_RPHE | DWT_INT_RFSL | /*DWT_INT_TFRS |*/ DWT_INT_RXDFR | DWT_INT_RXPTO);
+
+    dwt_setpreambledetecttimeout(RESP_RX_PREAMBLE_DETECTION_TIMEOUT_UUS);
 
     DEBUG_PRINT("dw1kDeck initialization complete\n");
 
-    xTaskCreate(dw1kDeckTask, "dw1kDeckTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
+    xTaskCreate(dw1kDeckTask, "dw1kDeckTask", configMINIMAL_STACK_SIZE, NULL, LPS_DECK_TASK_PRI, &dw1kTaskHandle);
     // Normally hardware initialization would happen here. For the example we
     // simply flag the driver as initialized.
     isInit = true;
@@ -242,7 +293,6 @@ DECK_DRIVER(dw1kDeckDriver);
 
 PARAM_GROUP_START(deck)
 PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, dw1k, &isInit)
-// PARAM_ADD_WITH_CALLBACK(PARAM_UINT8, resetCounters, &resetCountersRequest, resetCountersCallback)
 PARAM_GROUP_STOP(deck)
 
 // ----------------------------- Logging ------------------------------------
@@ -250,9 +300,5 @@ PARAM_GROUP_STOP(deck)
 // value that can be streamed or fetched through the logging subsystem.
 
 LOG_GROUP_START(dw1k)
-LOG_ADD(LOG_UINT8, ready, &isInit)
-LOG_ADD(LOG_UINT16, interval, &rangingIntervalMs)
-LOG_ADD(LOG_FLOAT, range, &lastRangeMeters)
-LOG_ADD(LOG_UINT32, successCount, &successfulMeasurements)
-LOG_ADD(LOG_UINT32, failCount, &failedMeasurements)
+LOG_ADD(LOG_INT32, rangingCounter, &lastRangingCounter)
 LOG_GROUP_STOP(dw1k)
