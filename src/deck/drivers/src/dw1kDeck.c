@@ -54,9 +54,9 @@
 // @note - example for computing the PDTCP: PRF = 64, PACS = 8, PDTCV = X, PDTCP = (127 * 4) * (1/499200000) * 8 * (X + 1) * 10e6 ≈ Y microseconds.
 #define RESP_RX_PREAMBLE_DETECTION_TIMEOUT_UUS 200
 
-static bool isInit = false;
+#define TASK_DELAY_MS 10    
 
-static uint16_t rangingIntervalMs = 50;
+static bool isInit = false;
 
 static uint32_t lastRangingCounter = 0;
 
@@ -66,6 +66,7 @@ static uint8_t uwb_poll_frame[] = {0x41, 0x88, UINT8_C(0x00), 0xCA, 0xDE, 'W', '
 static uint8_t uwb_resp_frame[] = {0x41, 0x88, UINT8_C(0x00), 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00), UINT8_C(0x00)};
 
 static uint8_t uwb_frame_seqnum = UINT8_C(0x00);
+static uint8_t uwb_measnum = UINT8_C(0x00);
 
 static uint32_t uwb_poll_tx_resp_rx_delta = UINT32_C(0x00);
 static uint32_t uwb_poll_rx_resp_tx_delta = UINT32_C(0x00);
@@ -92,7 +93,6 @@ int writetospi(uint16_t head_octets_number, const uint8_t* head_octets_buffer, u
     spiExchange(head_octets_number + body_octets_number, spiTxBuffer, spiRxBuffer);
     digitalWrite(CS_PIN, HIGH);
     spiEndTransaction();
-    // STATS_CNT_RATE_EVENT(&spiWriteCount);
     return 0;
 }
 
@@ -106,7 +106,6 @@ int readfromspi(uint16_t head_octets_number, const uint8_t* head_octets_buffer, 
     memcpy(body_octets_buffer, spiRxBuffer + head_octets_number, body_octets_number);
     digitalWrite(CS_PIN, HIGH);
     spiEndTransaction();
-    // STATS_CNT_RATE_EVENT(&spiReadCount);
     return 0;
 }
 
@@ -119,28 +118,22 @@ void dw1kHandleInterrupt(void* parameters)
 {
     uwb_sys_status = dwt_read32bitreg(SYS_STATUS_ID);
 
-    // DEBUG_PRINT("0x%08X\n", (unsigned int)uwb_sys_status);
-
     if (uwb_sys_status & SYS_STATUS_TXFRS)
     {
-        // DEBUG_PRINT("A\n");
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX);
     }
 
     if (uwb_sys_status & (SYS_STATUS_RXPHE | SYS_STATUS_RXRFSL))
     {
-        // DEBUG_PRINT("B\n");
         dwt_rxreset();
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
     }
     else if (uwb_sys_status & (SYS_STATUS_RXPTO | SYS_STATUS_RXSFDTO))
     {
-        // DEBUG_PRINT("C\n");
         dwt_write32bitreg(SYS_STATUS_ID, (SYS_STATUS_RXPTO | SYS_STATUS_RXSFDTO));
     }
     else if (uwb_sys_status & (SYS_STATUS_LDEDONE | SYS_STATUS_RXFCG))
     {
-        // DEBUG_PRINT("RXGOOD\n");
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD);
 
         dwt_readfromdevice(RX_BUFFER_ID, UINT8_C(0x00), sizeof(uwb_resp_frame) - UINT8_C(0x02), uwb_rx_buffer);
@@ -156,12 +149,11 @@ void dw1kHandleInterrupt(void* parameters)
             uwb_poll_rx_resp_tx_delta = *((uint32_t*)(&uwb_rx_buffer[sizeof(uwb_resp_frame) - UINT8_C(0x06)]));
 
             lastRangingCounter = (uwb_poll_tx_resp_rx_delta - uwb_poll_rx_resp_tx_delta);
-
-            // DEBUG_PRINT("D\n");
+            
+            uwb_measnum++;
         }
         else
         {
-            // DEBUG_PRINT("E%u,%u\n", uwb_frame_seqnum, uwb_rx_buffer[UINT8_C(0x02)]);
         }
     }
 }
@@ -169,11 +161,14 @@ void dw1kHandleInterrupt(void* parameters)
 static void dw1kDeckTask(void* parameters)
 {
     systemWaitStart();
-    vTaskDelay(M2T(10000));
+        
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = M2T(TASK_DELAY_MS);
+    
     while (1)
     {
-        // DEBUG_PRINT("LB\n");
-
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        
         uwb_poll_frame[UINT8_C(2)] = uwb_frame_seqnum;
 
         dwt_writetodevice(TX_BUFFER_ID, UINT8_C(0x00), sizeof(uwb_poll_frame) - UINT8_C(0x02), uwb_poll_frame);
@@ -188,14 +183,10 @@ static void dw1kDeckTask(void* parameters)
         }
         else
         {
-            // DEBUG_PRINT("O\n");
+            uwb_measnum = 0;
         }
 
         uwb_frame_seqnum++;
-
-        // DEBUG_PRINT("LE\n");
-
-        vTaskDelay(M2T(rangingIntervalMs));
     }
 }
 
@@ -300,5 +291,7 @@ PARAM_GROUP_STOP(deck)
 // value that can be streamed or fetched through the logging subsystem.
 
 LOG_GROUP_START(dw1k)
-LOG_ADD(LOG_INT32, rangingCounter, &lastRangingCounter)
+LOG_ADD(LOG_UINT32, rangingCounter, &lastRangingCounter)
+// LOG_ADD(LOG_UINT8, sequenceNumber, &uwb_frame_seqnum)
+LOG_ADD(LOG_UINT8, measurementNumber, &uwb_measnum)
 LOG_GROUP_STOP(dw1k)
